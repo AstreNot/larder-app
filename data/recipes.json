@@ -1,0 +1,86 @@
+[
+  {
+    "name": "Fruit salad",
+    "ingredients": ["banana", "apple", "orange", "honey"],
+    "tags": ["vegetarian", "vegan-optional"],
+    "instructions": "Chop banana, apple, and orange into bite-size pieces, toss together, drizzle with honey."
+  },
+  {
+    "name": "Banana oat pancakes",
+    "ingredients": ["banana", "egg", "oats", "milk"],
+    "tags": ["vegetarian"],
+    "instructions": "Mash banana, whisk with egg and milk, fold in oats, cook spoonfuls on a hot pan until golden."
+  },
+  {
+    "name": "Apple cinnamon oatmeal",
+    "ingredients": ["apple", "oats", "milk", "cinnamon"],
+    "tags": ["vegetarian"],
+    "instructions": "Simmer oats in milk, stir in diced apple and a pinch of cinnamon until soft and creamy."
+  },
+  {
+    "name": "Citrus glazed carrots",
+    "ingredients": ["carrot", "orange", "butter", "honey"],
+    "tags": ["vegetarian"],
+    "instructions": "Simmer sliced carrots with orange juice, butter, and honey until glazed and tender."
+  },
+  {
+    "name": "Broccoli carrot stir fry",
+    "ingredients": ["broccoli", "carrot", "garlic", "soy sauce", "rice"],
+    "tags": ["vegetarian", "vegan"],
+    "instructions": "Stir fry broccoli and carrot with garlic, splash with soy sauce, serve over rice."
+  },
+  {
+    "name": "Roasted broccoli with garlic",
+    "ingredients": ["broccoli", "garlic", "olive oil", "parmesan"],
+    "tags": ["vegetarian"],
+    "instructions": "Toss broccoli with garlic and olive oil, roast until crisp, finish with grated parmesan."
+  },
+  {
+    "name": "Classic hot dog",
+    "ingredients": ["hot dog", "bun", "mustard", "onion"],
+    "tags": [],
+    "instructions": "Grill or boil the hot dog, tuck into a bun, top with mustard and diced onion."
+  },
+  {
+    "name": "Loaded pizza night",
+    "ingredients": ["pizza", "cheese", "chili flakes"],
+    "tags": ["vegetarian"],
+    "instructions": "Bake pizza according to package instructions, top with extra cheese and chili flakes."
+  },
+  {
+    "name": "Weekend donut breakfast",
+    "ingredients": ["donut", "coffee"],
+    "tags": ["vegetarian"],
+    "instructions": "Warm the donut for 10 seconds, serve with fresh coffee. Not everything needs to be complicated."
+  },
+  {
+    "name": "Simple cake plate",
+    "ingredients": ["cake", "berries", "whipped cream"],
+    "tags": ["vegetarian"],
+    "instructions": "Slice cake, top with fresh berries and a spoon of whipped cream."
+  },
+  {
+    "name": "Deli sandwich upgrade",
+    "ingredients": ["sandwich", "pickles", "chips"],
+    "tags": [],
+    "instructions": "Warm the sandwich slightly if it has cheese, serve with pickles and chips on the side."
+  },
+  {
+    "name": "Garlic butter pasta",
+    "ingredients": ["pasta", "garlic", "butter", "parmesan"],
+    "tags": ["vegetarian"],
+    "instructions": "Boil pasta, toss with melted garlic butter, finish with grated parmesan."
+  },
+  {
+    "name": "Simple egg fried rice",
+    "ingredients": ["rice", "egg", "carrot", "soy sauce"],
+    "tags": ["vegetarian"],
+    "instructions": "Scramble egg, stir in cooked rice and diced carrot, season with soy sauce."
+  },
+  {
+    "name": "Bottled sparkling refresher",
+    "ingredients": ["bottle", "orange", "mint"],
+    "tags": ["vegetarian", "vegan"],
+    "instructions": "Pour the bottled drink over ice, add a squeeze of orange and a few mint leaves."
+  }
+]

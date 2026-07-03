@@ -1,24 +1,7 @@
-// NOTE: verify this model name is still current at https://ai.google.dev before relying on it —
-// Google renames/deprecates Gemini model versions periodically and this may be out of date.
-const GEMINI_MODEL = "gemini-2.0-flash";
-
-const SCAN_PROMPT = `You are analyzing a photo of a fridge or pantry to extract a food inventory.
-
-Identify every distinct food item visible, including spices, condiments, and packaged goods. Give your best estimate even when uncertain.
-
-Return ONLY valid JSON, no markdown fences, no preamble:
-{
-  "items": [
-    {
-      "name": "string, singular, lowercase",
-      "quantity_estimate": "string, e.g. '6', 'half bag', 'unknown'",
-      "category": "one of: produce, dairy, meat, grain, spice, condiment, pantry, beverage, other",
-      "confidence": "one of: high, medium, low",
-      "expires_in_days": number or null,
-      "note": "optional, only if ambiguous"
-    }
-  ]
-}`;
+// This route no longer calls a vision LLM. It proxies the photo to your
+// self-hosted YOLO server (see /yolo-server) running on your VM, which does
+// detection locally and returns the same {items: [...]} shape the frontend
+// already expects. This is what eliminates the image-token rate limit issue.
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -30,48 +13,33 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing image or mediaType in request body" });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).json({ error: "Server is missing GEMINI_API_KEY. Set it in your Vercel project's environment variables." });
+  if (!process.env.YOLO_SERVER_URL) {
+    return res.status(500).json({ error: "Server is missing YOLO_SERVER_URL. Set it in your Vercel project's environment variables to your VM's tunnel URL, e.g. https://xxxx.trycloudflare.com/detect" });
+  }
+  if (!process.env.YOLO_SHARED_SECRET) {
+    return res.status(500).json({ error: "Server is missing YOLO_SHARED_SECRET. Set it to match the SHARED_SECRET env var on your VM." });
   }
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { inline_data: { mime_type: mediaType, data: image } },
-                { text: SCAN_PROMPT },
-              ],
-            },
-          ],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-      }
-    );
+    const response = await fetch(process.env.YOLO_SERVER_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-shared-secret": process.env.YOLO_SHARED_SECRET,
+      },
+      body: JSON.stringify({ image_base64: image, media_type: mediaType }),
+    });
 
     const data = await response.json();
 
     if (!response.ok) {
-      return res.status(response.status).json({ error: data?.error?.message || "Gemini API error" });
+      return res.status(response.status).json({ error: data?.detail || "Vision server error" });
     }
 
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
-    const cleaned = text.replace(/```json|```/g, "").trim();
-
-    let parsed;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch (parseErr) {
-      return res.status(502).json({ error: "Model returned unparseable output. Try again." });
-    }
-
-    return res.status(200).json(parsed);
+    // The VM already returns items in the shape the frontend expects
+    // ({ items: [{ name, quantity_estimate, category, confidence, expires_in_days, note }] }).
+    return res.status(200).json(data);
   } catch (err) {
-    return res.status(500).json({ error: "Failed to process photo: " + err.message });
+    return res.status(502).json({ error: "Couldn't reach the vision server. Is the VM running and the tunnel URL correct? " + err.message });
   }
 }
