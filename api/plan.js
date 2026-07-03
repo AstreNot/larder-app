@@ -1,3 +1,7 @@
+// NOTE: verify this model name is still current at https://ai.google.dev before relying on it —
+// Google renames/deprecates Gemini model versions periodically and this may be out of date.
+const GEMINI_MODEL = "gemini-2.0-flash";
+
 function buildPrompt(inventory, dietary) {
   return `You are a meal-planning assistant. Given a household's current food inventory, generate a 7-day dinner meal plan (Monday through Sunday).
 
@@ -39,35 +43,30 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing or empty inventory array in request body" });
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your Vercel project's environment variables." });
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: "Server is missing GEMINI_API_KEY. Set it in your Vercel project's environment variables." });
   }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-5",
-        max_tokens: 2000,
-        messages: [{ role: "user", content: buildPrompt(inventory, dietary) }],
-      }),
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: buildPrompt(inventory, dietary) }] }],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      }
+    );
 
     const data = await response.json();
 
     if (!response.ok) {
-      return res.status(response.status).json({ error: data?.error?.message || "Anthropic API error" });
+      return res.status(response.status).json({ error: data?.error?.message || "Gemini API error" });
     }
 
-    const text = (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
+    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
     const cleaned = text.replace(/```json|```/g, "").trim();
 
     let parsed;
