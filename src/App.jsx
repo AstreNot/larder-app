@@ -7,8 +7,11 @@ import {
   signUp,
   signOut,
   getOrCreateDefaultHousehold,
+  getHousehold,
+  updateHouseholdBudget,
   getInventory,
   upsertInventoryItems,
+  quickAddInventoryItem,
   addManualInventoryItem,
   updateInventoryItem,
   deleteInventoryItem,
@@ -17,6 +20,10 @@ import {
   createChore,
   toggleChoreDone,
   deleteChore,
+  getRecipes,
+  forkOrUpdateRecipe,
+  createRecipe,
+  deleteRecipe,
   saveReceipt,
   getReceipts,
 } from "./supabaseClient";
@@ -54,19 +61,38 @@ function expiryTier(days) {
   return "fresh";
 }
 
+// Units only combine within the same family — mass units convert to grams,
+// volume units convert to milliliters, "pcs" stands alone. A recipe needing
+// grams of something the pantry has logged in pcs can't be safely combined,
+// so it's treated as a family mismatch rather than guessed at.
+const UNIT_FAMILY = { g: "mass", kg: "mass", ml: "volume", l: "volume", pcs: "count" };
+const TO_BASE_UNIT = { g: 1, kg: 1000, ml: 1, l: 1000, pcs: 1 };
+const BASE_UNIT_LABEL = { mass: "g", volume: "ml", count: "pcs" };
+
 function normalizeName(name) {
   return (name || "").trim().toLowerCase();
 }
 
 // Converts a Supabase inventory_items row into the shape the UI uses.
+// expiresInDays is computed here from the real expiry_date, rather than
+// trusting a stored day-count, since a stored number goes stale as days pass.
 function rowToItem(row) {
+  let expiresInDays = null;
+  if (row.expiry_date) {
+    const msPerDay = 86400000;
+    const today = new Date(new Date().toDateString());
+    const expiry = new Date(row.expiry_date);
+    expiresInDays = Math.round((expiry - today) / msPerDay);
+  }
   return {
     id: row.id,
     name: row.name,
-    quantity: row.quantity ?? "unknown",
+    quantityAmount: row.quantity_amount ?? null,
+    quantityUnit: row.quantity_unit ?? null,
     category: row.category || "other",
     confidence: row.confidence || "medium",
-    expiresInDays: row.expires_in_days ?? null,
+    expiresInDays,
+    expiryDate: row.expiry_date ?? null,
     note: row.note || null,
   };
 }
@@ -124,6 +150,26 @@ function parseReceiptText(text) {
     }
   }
   return items;
+}
+
+// Builds a 6-row (42-cell) month grid for a simple from-scratch calendar —
+// no charting/calendar library needed for something this contained.
+function buildCalendarGrid(monthDate) {
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+  const firstDay = new Date(year, month, 1);
+  const startOffset = firstDay.getDay(); // 0 = Sunday
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  const cells = [];
+  for (let i = 0; i < startOffset; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(year, month, d));
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
+}
+
+function toDateKey(date) {
+  return date.toISOString().slice(0, 10);
 }
 
 // ── Minimal auth gate ──────────────────────────────────────────
@@ -227,6 +273,13 @@ export default function App() {
   const [checked, setChecked] = useState({});
   const [expandedDay, setExpandedDay] = useState(null);
   const [manualName, setManualName] = useState("");
+  const [showManualForm, setShowManualForm] = useState(false);
+  const [manualFullName, setManualFullName] = useState("");
+  const [manualQuantityAmount, setManualQuantityAmount] = useState("");
+  const [manualQuantityUnit, setManualQuantityUnit] = useState("pcs");
+  const [manualExpiryDate, setManualExpiryDate] = useState("");
+  const [manualCategory, setManualCategory] = useState("other");
+  const [manualNote, setManualNote] = useState("");
   const fileInputRef = useRef(null);
 
   const [chores, setChores] = useState([]);
@@ -235,7 +288,13 @@ export default function App() {
   const [choreTitle, setChoreTitle] = useState("");
   const [choreAssignee, setChoreAssignee] = useState("");
   const [choreDueDate, setChoreDueDate] = useState("");
+  const [choreDueTime, setChoreDueTime] = useState("");
   const [choreRecurrence, setChoreRecurrence] = useState("none");
+  const [choresView, setChoresView] = useState("list"); // "list" | "calendar"
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
 
   const [receipts, setReceipts] = useState([]);
   const [budgetError, setBudgetError] = useState(null);
@@ -244,6 +303,26 @@ export default function App() {
   const [reviewRawText, setReviewRawText] = useState("");
   const [reviewDate, setReviewDate] = useState("");
   const receiptInputRef = useRef(null);
+
+  const [householdInfo, setHouseholdInfo] = useState(null);
+  const [incomeInput, setIncomeInput] = useState("");
+  const [savingsGoalInput, setSavingsGoalInput] = useState("20");
+  const [debtInput, setDebtInput] = useState("");
+  const [emergencyFundInput, setEmergencyFundInput] = useState("");
+  const [emergencyMonthsInput, setEmergencyMonthsInput] = useState("6");
+  const [savingBudget, setSavingBudget] = useState(false);
+
+  const [weekView, setWeekView] = useState("auto"); // "auto" | "browse"
+  const [recipes, setRecipes] = useState([]);
+  const [recipesError, setRecipesError] = useState(null);
+  const [recipeSearch, setRecipeSearch] = useState("");
+  const [selectedRecipeIds, setSelectedRecipeIds] = useState(() => new Set());
+  const [editingRecipeId, setEditingRecipeId] = useState(null); // "new" for a fresh recipe
+  const [editName, setEditName] = useState("");
+  const [editTags, setEditTags] = useState("");
+  const [editInstructions, setEditInstructions] = useState("");
+  const [editIngredients, setEditIngredients] = useState([]);
+  const [groceryListGenerated, setGroceryListGenerated] = useState(false);
 
   // ── Auth bootstrap ────────────────────────────────────────
   useEffect(() => {
@@ -267,15 +346,24 @@ export default function App() {
         if (cancelled) return;
         setInventory(rows.map(rowToItem));
 
-        const [choreRows, members, receiptRows] = await Promise.all([
+        const [choreRows, members, receiptRows, household, recipeRows] = await Promise.all([
           getChores(hid),
           getHouseholdMembers(hid),
           getReceipts(hid),
+          getHousehold(hid),
+          getRecipes(hid),
         ]);
         if (cancelled) return;
         setChores(choreRows);
         setHouseholdMembers(members);
         setReceipts(receiptRows);
+        setHouseholdInfo(household);
+        setIncomeInput(household.monthly_income != null ? String(household.monthly_income) : "");
+        setSavingsGoalInput(household.savings_goal_percent != null ? String(household.savings_goal_percent) : "20");
+        setDebtInput(household.monthly_debt_payments != null ? String(household.monthly_debt_payments) : "");
+        setEmergencyFundInput(household.emergency_fund_balance != null ? String(household.emergency_fund_balance) : "");
+        setEmergencyMonthsInput(household.emergency_fund_target_months != null ? String(household.emergency_fund_target_months) : "6");
+        setRecipes(recipeRows);
       } catch (err) {
         if (!cancelled) setInventoryError(err.message || "Couldn't load your pantry.");
       } finally {
@@ -351,12 +439,54 @@ export default function App() {
     if (!name || !householdId) return;
     setManualName("");
     try {
-      const row = await addManualInventoryItem(householdId, name);
+      const row = await quickAddInventoryItem(householdId, name);
       setInventory((prev) => {
         const byName = new Map(prev.map((it) => [normalizeName(it.name), it]));
         byName.set(normalizeName(row.name), rowToItem(row));
         return Array.from(byName.values());
       });
+    } catch (err) {
+      setInventoryError(err.message || "Couldn't add that item.");
+    }
+  };
+
+  const submitManualForm = async () => {
+    const name = manualFullName.trim();
+    const amount = parseFloat(manualQuantityAmount);
+    if (!name || !householdId) {
+      setInventoryError("Item name is required.");
+      return;
+    }
+    if (isNaN(amount) || amount <= 0) {
+      setInventoryError("Enter a valid quantity.");
+      return;
+    }
+    if (!manualQuantityUnit) {
+      setInventoryError("Pick a unit.");
+      return;
+    }
+    setInventoryError(null);
+    try {
+      const row = await addManualInventoryItem(householdId, {
+        name,
+        quantityAmount: amount,
+        quantityUnit: manualQuantityUnit,
+        expiryDate: manualExpiryDate || null,
+        category: manualCategory,
+        note: manualNote || null,
+      });
+      setInventory((prev) => {
+        const byName = new Map(prev.map((it) => [normalizeName(it.name), it]));
+        byName.set(normalizeName(row.name), rowToItem(row));
+        return Array.from(byName.values());
+      });
+      setManualFullName("");
+      setManualQuantityAmount("");
+      setManualQuantityUnit("pcs");
+      setManualExpiryDate("");
+      setManualCategory("other");
+      setManualNote("");
+      setShowManualForm(false);
     } catch (err) {
       setInventoryError(err.message || "Couldn't add that item.");
     }
@@ -371,11 +501,13 @@ export default function App() {
         title,
         assignedTo: choreAssignee || null,
         dueDate: choreDueDate || null,
+        dueTime: choreDueTime || null,
         recurrence: choreRecurrence,
       });
       setChores((prev) => [...prev, chore]);
       setChoreTitle("");
       setChoreDueDate("");
+      setChoreDueTime("");
       setChoreRecurrence("none");
     } catch (err) {
       setChoresError(err.message || "Couldn't add that chore.");
@@ -482,6 +614,234 @@ export default function App() {
     return Array.from(map.entries()).sort((a, b) => b[0].localeCompare(a[0]));
   }, [receipts]);
 
+  const currentMonthKey = new Date().toISOString().slice(0, 7);
+  const currentMonthSpend = useMemo(() => {
+    const entry = monthlyTotals.find(([month]) => month === currentMonthKey);
+    return entry ? entry[1] : 0;
+  }, [monthlyTotals, currentMonthKey]);
+
+  // Four common personal-finance heuristics, each checked independently:
+  // cashflow staying positive, debt payments not eating too much of income,
+  // an actual savings rate, and an emergency fund sized in months of spend.
+  // These are standard, widely-taught rules of thumb (not tied to any one
+  // source) — the specific thresholds are defaults you can override via the
+  // savings-goal and emergency-fund-months inputs.
+  const budgetHealth = useMemo(() => {
+    const income = householdInfo?.monthly_income;
+    if (!income || income <= 0) return { status: "unset", checks: [] };
+
+    const savingsGoalPercent = householdInfo?.savings_goal_percent ?? 20;
+    const debtPayments = Number(householdInfo?.monthly_debt_payments) || 0;
+    const emergencyBalance = Number(householdInfo?.emergency_fund_balance) || 0;
+    const emergencyTargetMonths = Number(householdInfo?.emergency_fund_target_months) || 6;
+
+    const cashflow = income - currentMonthSpend - debtPayments;
+    const debtRatio = (debtPayments / income) * 100;
+    const savingsRate = (cashflow / income) * 100;
+    const emergencyTarget = currentMonthSpend > 0 ? currentMonthSpend * emergencyTargetMonths : 0;
+    const emergencyProgress = emergencyTarget > 0 ? Math.min((emergencyBalance / emergencyTarget) * 100, 100) : null;
+
+    const checks = [
+      {
+        key: "cashflow",
+        label: "Cashflow",
+        pass: cashflow >= 0,
+        detail: cashflow >= 0 ? `$${cashflow.toFixed(2)} left after spending and debt` : `$${Math.abs(cashflow).toFixed(2)} short this month`,
+      },
+      {
+        key: "debt",
+        label: "Debt load",
+        pass: debtRatio <= 30,
+        detail: `${debtRatio.toFixed(0)}% of income goes to debt payments (aim for 30% or under)`,
+      },
+      {
+        key: "savings",
+        label: "Savings rate",
+        pass: savingsRate >= savingsGoalPercent,
+        detail: `${savingsRate.toFixed(0)}% saved this month (goal: ${savingsGoalPercent}%)`,
+      },
+      {
+        key: "emergency",
+        label: "Emergency fund",
+        pass: emergencyProgress === null ? true : emergencyProgress >= 100,
+        detail: emergencyProgress === null
+          ? "Not enough spend history yet to size a target"
+          : `${emergencyProgress.toFixed(0)}% of your ${emergencyTargetMonths}-month target ($${emergencyTarget.toFixed(0)})`,
+      },
+    ];
+
+    const passCount = checks.filter((c) => c.pass).length;
+    const status = passCount === checks.length ? "healthy" : passCount >= checks.length - 1 ? "caution" : "over";
+
+    return { status, checks, cashflow, remaining: cashflow };
+  }, [householdInfo, currentMonthSpend]);
+
+  const saveBudgetSettings = async () => {
+    if (!householdId) return;
+    const income = parseFloat(incomeInput);
+    const goal = parseFloat(savingsGoalInput);
+    const debt = parseFloat(debtInput);
+    const emergencyBalance = parseFloat(emergencyFundInput);
+    const emergencyMonths = parseFloat(emergencyMonthsInput);
+    setSavingBudget(true);
+    setBudgetError(null);
+    try {
+      const updated = await updateHouseholdBudget(householdId, {
+        monthlyIncome: isNaN(income) ? null : income,
+        savingsGoalPercent: isNaN(goal) ? 20 : goal,
+        monthlyDebtPayments: isNaN(debt) ? 0 : debt,
+        emergencyFundBalance: isNaN(emergencyBalance) ? 0 : emergencyBalance,
+        emergencyFundTargetMonths: isNaN(emergencyMonths) ? 6 : emergencyMonths,
+      });
+      setHouseholdInfo(updated);
+    } catch (err) {
+      setBudgetError(err.message || "Couldn't save budget settings.");
+    } finally {
+      setSavingBudget(false);
+    }
+  };
+
+  const filteredRecipes = useMemo(() => {
+    const q = recipeSearch.trim().toLowerCase();
+    if (!q) return recipes;
+    return recipes.filter((r) =>
+      r.name.toLowerCase().includes(q) ||
+      (r.tags || []).some((t) => t.toLowerCase().includes(q)) ||
+      (r.ingredients || []).some((ing) => ing.name.toLowerCase().includes(q))
+    );
+  }, [recipes, recipeSearch]);
+
+  const toggleRecipeSelected = (id) => {
+    setSelectedRecipeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const openEditRecipe = (recipe) => {
+    setEditingRecipeId(recipe.id);
+    setEditName(recipe.name);
+    setEditTags((recipe.tags || []).join(", "));
+    setEditInstructions(recipe.instructions || "");
+    setEditIngredients((recipe.ingredients || []).map((ing, i) => ({ id: `ing_${i}`, ...ing })));
+  };
+
+  const openNewRecipe = () => {
+    setEditingRecipeId("new");
+    setEditName("");
+    setEditTags("");
+    setEditInstructions("");
+    setEditIngredients([{ id: "ing_0", name: "", amount: "", unit: "pcs" }]);
+  };
+
+  const closeEditRecipe = () => {
+    setEditingRecipeId(null);
+  };
+
+  const updateEditIngredient = (id, patch) => {
+    setEditIngredients((prev) => prev.map((ing) => (ing.id === id ? { ...ing, ...patch } : ing)));
+  };
+
+  const removeEditIngredient = (id) => {
+    setEditIngredients((prev) => prev.filter((ing) => ing.id !== id));
+  };
+
+  const addEditIngredient = () => {
+    setEditIngredients((prev) => [...prev, { id: `ing_${Date.now()}`, name: "", amount: "", unit: "pcs" }]);
+  };
+
+  const saveRecipe = async () => {
+    if (!householdId || !editName.trim()) {
+      setRecipesError("Recipe name is required.");
+      return;
+    }
+    setRecipesError(null);
+    const cleanIngredients = editIngredients
+      .filter((ing) => ing.name.trim())
+      .map((ing) => ({ name: ing.name.trim(), amount: parseFloat(ing.amount) || 0, unit: ing.unit || "pcs" }));
+    const tags = editTags.split(",").map((t) => t.trim()).filter(Boolean);
+
+    try {
+      if (editingRecipeId === "new") {
+        const recipe = await createRecipe(householdId, { name: editName.trim(), ingredients: cleanIngredients, tags, instructions: editInstructions });
+        setRecipes((prev) => [...prev, recipe].sort((a, b) => a.name.localeCompare(b.name)));
+      } else {
+        const original = recipes.find((r) => r.id === editingRecipeId);
+        const saved = await forkOrUpdateRecipe(householdId, original, {
+          name: editName.trim(),
+          ingredients: cleanIngredients,
+          tags,
+          instructions: editInstructions,
+        });
+        setRecipes((prev) => {
+          const withoutOriginal = original.household_id === null ? prev : prev.filter((r) => r.id !== original.id);
+          return [...withoutOriginal, saved].sort((a, b) => a.name.localeCompare(b.name));
+        });
+      }
+      closeEditRecipe();
+    } catch (err) {
+      setRecipesError(err.message || "Couldn't save that recipe.");
+    }
+  };
+
+  const removeRecipe = async (recipe) => {
+    if (recipe.household_id === null) return; // can't delete global starter recipes
+    setRecipes((prev) => prev.filter((r) => r.id !== recipe.id));
+    setSelectedRecipeIds((prev) => {
+      const next = new Set(prev);
+      next.delete(recipe.id);
+      return next;
+    });
+    try {
+      await deleteRecipe(recipe.id);
+    } catch (err) {
+      setRecipesError(err.message || "Couldn't delete that recipe.");
+    }
+  };
+
+  // Sums ingredient needs across every selected recipe (converted to a base
+  // unit per family), then compares each against matching pantry items.
+  // Recomputes live if inventory or the selection changes while the panel
+  // is open — "generated" just controls whether the panel is shown at all.
+  const groceryResults = useMemo(() => {
+    const needed = new Map(); // key: normalizedName:family -> { name, family, amountBase }
+    for (const id of selectedRecipeIds) {
+      const recipe = recipes.find((r) => r.id === id);
+      if (!recipe) continue;
+      for (const ing of recipe.ingredients || []) {
+        const family = UNIT_FAMILY[ing.unit] || "count";
+        const amountBase = (parseFloat(ing.amount) || 0) * (TO_BASE_UNIT[ing.unit] || 1);
+        const key = `${normalizeName(ing.name)}:${family}`;
+        if (!needed.has(key)) needed.set(key, { name: ing.name, family, amountBase: 0 });
+        needed.get(key).amountBase += amountBase;
+      }
+    }
+
+    return Array.from(needed.values())
+      .map((n) => {
+        const matches = inventory.filter(
+          (it) => normalizeName(it.name) === normalizeName(n.name) && (UNIT_FAMILY[it.quantityUnit] || "count") === n.family
+        );
+        const availableBase = matches.reduce(
+          (sum, it) => sum + (it.quantityAmount || 0) * (TO_BASE_UNIT[it.quantityUnit] || 1),
+          0
+        );
+        const percent = n.amountBase > 0 ? Math.min((availableBase / n.amountBase) * 100, 100) : 100;
+        const missingBase = Math.max(n.amountBase - availableBase, 0);
+        return {
+          name: n.name,
+          unit: BASE_UNIT_LABEL[n.family],
+          neededBase: n.amountBase,
+          availableBase,
+          percent,
+          missingBase,
+        };
+      })
+      .sort((a, b) => a.percent - b.percent);
+  }, [selectedRecipeIds, recipes, inventory]);
+
   const planWeek = async () => {
     setPlanError(null);
     setPlanning(true);
@@ -550,176 +910,323 @@ export default function App() {
     return <AuthGate />;
   }
 
+  const TABS = [
+    { key: "pantry", label: "Pantry", icon: Package },
+    { key: "week", label: "This week", icon: Calendar },
+    { key: "list", label: "List", icon: ShoppingCart },
+    { key: "chores", label: "Chores", icon: CheckSquare },
+    { key: "budget", label: "Budget", icon: DollarSign },
+  ];
+
   return (
     <div style={{ background: COLORS.bg, minHeight: "100vh", fontFamily: "'Inter', sans-serif", color: COLORS.ink }}>
-      <div className="max-w-md mx-auto px-4 pt-6 pb-24">
-        <div className="flex items-center justify-between mb-1">
-          <div className="flex items-center gap-2">
+      <div className="lg:flex lg:min-h-screen">
+        {/* Sidebar — desktop only */}
+        <div
+          className="hidden lg:flex lg:flex-col lg:w-56 lg:shrink-0 lg:sticky lg:top-0 lg:h-screen lg:py-6 lg:px-4"
+          style={{ borderRight: `0.5px solid ${COLORS.border}` }}
+        >
+          <div className="flex items-center gap-2 mb-8 px-2">
             <Package size={22} color={COLORS.fresh} />
-            <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 22 }}>Larder</h1>
+            <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 20 }}>Larder</h1>
           </div>
-          <button onClick={() => signOut()} style={{ color: COLORS.inkSoft, fontSize: 12 }}>
+          <nav className="flex flex-col gap-1 flex-1">
+            {TABS.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setTab(t.key)}
+                className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-left"
+                style={{
+                  background: tab === t.key ? COLORS.fresh : "transparent",
+                  color: tab === t.key ? "#fff" : COLORS.inkSoft,
+                  fontWeight: 500,
+                }}
+              >
+                <t.icon size={16} />
+                {t.label}
+              </button>
+            ))}
+          </nav>
+          <button onClick={() => signOut()} className="px-3 py-2 text-left text-sm" style={{ color: COLORS.inkSoft }}>
             Sign out
           </button>
         </div>
-        <p style={{ color: COLORS.inkSoft, fontSize: 13, marginBottom: 20 }}>
-          Snap what you have. Cook before it's gone.
-        </p>
 
-        {inventoryError && (
-          <div className="rounded-lg p-3 mb-4 text-sm" style={{ background: COLORS.urgentBg, color: COLORS.urgent }}>
-            {inventoryError}
-          </div>
-        )}
+        {/* Main content */}
+        <div className="flex-1 lg:overflow-y-auto">
+          <div className="max-w-md mx-auto px-4 pt-6 pb-24 lg:max-w-5xl lg:px-10 lg:py-8">
+            <div className="flex items-center justify-between mb-1 lg:hidden">
+              <div className="flex items-center gap-2">
+                <Package size={22} color={COLORS.fresh} />
+                <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 22 }}>Larder</h1>
+              </div>
+              <button onClick={() => signOut()} style={{ color: COLORS.inkSoft, fontSize: 12 }}>
+                Sign out
+              </button>
+            </div>
+            <p className="lg:hidden" style={{ color: COLORS.inkSoft, fontSize: 13, marginBottom: 20 }}>
+              Snap what you have. Cook before it's gone.
+            </p>
 
-        <div className="flex gap-1 mb-5 p-1 rounded-lg" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
-          {[
-            { key: "pantry", label: "Pantry", icon: Package },
-            { key: "week", label: "This week", icon: Calendar },
-            { key: "list", label: "List", icon: ShoppingCart },
-            { key: "chores", label: "Chores", icon: CheckSquare },
-            { key: "budget", label: "Budget", icon: DollarSign },
-          ].map((t) => (
-            <button
-              key={t.key}
-              onClick={() => setTab(t.key)}
-              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-sm"
-              style={{
-                background: tab === t.key ? COLORS.fresh : "transparent",
-                color: tab === t.key ? "#fff" : COLORS.inkSoft,
-                fontWeight: 500,
-              }}
-            >
-              <t.icon size={14} />
-              {t.label}
-            </button>
-          ))}
-        </div>
+            <div className="hidden lg:block lg:mb-6">
+              <h2 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 26 }}>
+                {TABS.find((t) => t.key === tab)?.label}
+              </h2>
+            </div>
+
+            {inventoryError && (
+              <div className="rounded-lg p-3 mb-4 text-sm" style={{ background: COLORS.urgentBg, color: COLORS.urgent }}>
+                {inventoryError}
+              </div>
+            )}
+
+            <div className="flex gap-1 mb-5 p-1 rounded-lg lg:hidden" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+              {TABS.map((t) => (
+                <button
+                  key={t.key}
+                  onClick={() => setTab(t.key)}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-sm"
+                  style={{
+                    background: tab === t.key ? COLORS.fresh : "transparent",
+                    color: tab === t.key ? "#fff" : COLORS.inkSoft,
+                    fontWeight: 500,
+                  }}
+                >
+                  <t.icon size={14} />
+                  {t.label}
+                </button>
+              ))}
+            </div>
 
         {tab === "pantry" && (
-          <div>
-            <div
-              className="rounded-xl p-5 mb-4 flex flex-col items-center text-center cursor-pointer"
-              style={{ background: COLORS.surface, border: `1px dashed ${COLORS.border}` }}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              {preview ? (
-                <img src={preview} alt="Pantry preview" className="w-full h-32 object-cover rounded-lg mb-3" />
-              ) : (
-                <Camera size={28} color={COLORS.fresh} style={{ marginBottom: 8 }} />
-              )}
-              <div style={{ fontWeight: 500, fontSize: 14 }}>
-                {scanning ? "Reading your photo..." : preview ? "Add another angle" : "Take a photo of your fridge or pantry"}
-              </div>
-              {!scanning && (
-                <div style={{ color: COLORS.inkSoft, fontSize: 12, marginTop: 2 }}>
-                  Multiple photos merge into one list
-                </div>
-              )}
-              {scanning && <Loader2 size={16} className="animate-spin" style={{ marginTop: 8 }} color={COLORS.fresh} />}
-              <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
-            </div>
-
-            {scanError && (
-              <div className="rounded-lg p-3 mb-4 text-sm" style={{ background: COLORS.urgentBg, color: COLORS.urgent }}>
-                {scanError}
-              </div>
-            )}
-
-            {loadingInventory && (
-              <div className="flex items-center justify-center gap-2 py-6" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
-                <Loader2 size={14} className="animate-spin" /> Loading your pantry...
-              </div>
-            )}
-
-            {!loadingInventory && inventory.length === 0 && !scanning && (
-              <div className="text-center py-6" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
-                Nothing scanned yet. Take a photo, or add an item below.
-              </div>
-            )}
-
-            {Object.entries(grouped).map(([cat, items]) => (
-              <div key={cat} className="mb-4">
-                <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: COLORS.inkSoft, marginBottom: 6 }}>
-                  {cat}
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {items.map((item) => {
-                    const tier = expiryTier(item.expiresInDays);
-                    const tierBg = tier === "urgent" ? COLORS.urgentBg : tier === "soon" ? COLORS.soonBg : tier === "fresh" ? COLORS.freshBg : COLORS.surface;
-                    const tierColor = tier === "urgent" ? COLORS.urgent : tier === "soon" ? COLORS.soon : tier === "fresh" ? COLORS.fresh : COLORS.inkSoft;
-                    return (
-                      <div
-                        key={item.id}
-                        className="relative flex items-center gap-1.5 pl-2 pr-1.5 py-1.5 rounded-lg"
-                        style={{ background: tierBg, border: item.confidence === "low" ? `1px dashed ${tierColor}` : `0.5px solid ${COLORS.border}` }}
-                        title={item.note || (item.confidence === "low" ? "Not certain — tap to confirm" : "")}
-                      >
-                        <span style={{ width: 6, height: 6, borderRadius: 999, background: CATEGORY_DOTS[cat] || CATEGORY_DOTS.other, flexShrink: 0 }} />
-                        <input
-                          value={item.name}
-                          onChange={(e) => updateItemLocal(item.id, { name: e.target.value })}
-                          onBlur={(e) => commitItem(item.id, { name: e.target.value })}
-                          style={{ background: "transparent", fontSize: 13, fontWeight: 500, color: COLORS.ink, width: Math.max(item.name.length, 4) + "ch" }}
-                        />
-                        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: tierColor }}>
-                          {item.quantity}
-                        </span>
-                        {item.confidence === "low" && <AlertTriangle size={11} color={tierColor} />}
-                        <button onClick={() => removeItem(item.id)} aria-label={`Remove ${item.name}`} style={{ color: COLORS.inkSoft }}>
-                          <X size={12} />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-
-            <div className="flex gap-2 mt-4">
-              <input
-                value={manualName}
-                onChange={(e) => setManualName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && addManualItem()}
-                placeholder="Add an item by hand"
-                className="flex-1 rounded-lg px-3 py-2 text-sm"
-                style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}
-              />
-              <button onClick={addManualItem} className="rounded-lg px-3 flex items-center justify-center" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
-                <Plus size={16} color={COLORS.fresh} />
-              </button>
-            </div>
-
-            <div className="mt-6">
-              <input
-                value={dietary}
-                onChange={(e) => setDietary(e.target.value)}
-                placeholder="Dietary notes (optional) — e.g. vegetarian, no nuts"
-                className="w-full rounded-lg px-3 py-2 text-sm mb-2"
-                style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}
-              />
-              <button
-                onClick={planWeek}
-                disabled={inventory.length === 0 || planning}
-                className="w-full rounded-lg py-2.5 text-sm flex items-center justify-center gap-2"
-                style={{ background: inventory.length === 0 ? COLORS.border : COLORS.fresh, color: "#fff", fontWeight: 500 }}
+          <div className="lg:grid lg:grid-cols-[320px_1fr] lg:gap-8 lg:items-start">
+            <div>
+              <div
+                className="rounded-xl p-5 mb-4 flex flex-col items-center text-center cursor-pointer"
+                style={{ background: COLORS.surface, border: `1px dashed ${COLORS.border}` }}
+                onClick={() => fileInputRef.current?.click()}
               >
-                {planning ? <Loader2 size={15} className="animate-spin" /> : <Calendar size={15} />}
-                {planning ? "Planning your week..." : "Plan my week"}
+                {preview ? (
+                  <img src={preview} alt="Pantry preview" className="w-full h-32 object-cover rounded-lg mb-3" />
+                ) : (
+                  <Camera size={28} color={COLORS.fresh} style={{ marginBottom: 8 }} />
+                )}
+                <div style={{ fontWeight: 500, fontSize: 14 }}>
+                  {scanning ? "Reading your photo..." : preview ? "Add another angle" : "Take a photo of your fridge or pantry"}
+                </div>
+                {!scanning && (
+                  <div style={{ color: COLORS.inkSoft, fontSize: 12, marginTop: 2 }}>
+                    Multiple photos merge into one list
+                  </div>
+                )}
+                {scanning && <Loader2 size={16} className="animate-spin" style={{ marginTop: 8 }} color={COLORS.fresh} />}
+                <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
+              </div>
+
+              {scanError && (
+                <div className="rounded-lg p-3 mb-4 text-sm" style={{ background: COLORS.urgentBg, color: COLORS.urgent }}>
+                  {scanError}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <input
+                  value={manualName}
+                  onChange={(e) => setManualName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addManualItem()}
+                  placeholder="Add an item by hand"
+                  className="flex-1 rounded-lg px-3 py-2 text-sm"
+                  style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}
+                />
+                <button onClick={addManualItem} className="rounded-lg px-3 flex items-center justify-center" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+                  <Plus size={16} color={COLORS.fresh} />
+                </button>
+              </div>
+
+              <button
+                onClick={() => setShowManualForm((v) => !v)}
+                className="flex items-center gap-1 mt-2 text-sm"
+                style={{ color: COLORS.inkSoft }}
+              >
+                Fill manually {showManualForm ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
               </button>
-              {planError && <div style={{ color: COLORS.urgent, fontSize: 12, marginTop: 6 }}>{planError}</div>}
+
+              {showManualForm && (
+                <div className="rounded-lg p-3 mt-2" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 8 }}>
+                    Item, quantity, and unit are required. Everything else is optional.
+                  </div>
+                  <input
+                    value={manualFullName}
+                    onChange={(e) => setManualFullName(e.target.value)}
+                    placeholder="Item name *"
+                    className="w-full rounded-lg px-3 py-2 text-sm mb-2"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                  <div className="flex gap-2 mb-2">
+                    <input
+                      value={manualQuantityAmount}
+                      onChange={(e) => setManualQuantityAmount(e.target.value)}
+                      type="number"
+                      step="any"
+                      placeholder="Quantity *"
+                      className="flex-1 rounded-lg px-3 py-2 text-sm"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    />
+                    <select
+                      value={manualQuantityUnit}
+                      onChange={(e) => setManualQuantityUnit(e.target.value)}
+                      className="rounded-lg px-2 py-2 text-sm"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    >
+                      <option value="pcs">pcs</option>
+                      <option value="g">g</option>
+                      <option value="kg">kg</option>
+                      <option value="ml">ml</option>
+                      <option value="l">l</option>
+                    </select>
+                  </div>
+                  <div className="flex gap-2 mb-2">
+                    <input
+                      type="date"
+                      value={manualExpiryDate}
+                      onChange={(e) => setManualExpiryDate(e.target.value)}
+                      className="flex-1 rounded-lg px-3 py-2 text-sm"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    />
+                    <select
+                      value={manualCategory}
+                      onChange={(e) => setManualCategory(e.target.value)}
+                      className="flex-1 rounded-lg px-2 py-2 text-sm"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    >
+                      {Object.keys(CATEGORY_DOTS).map((cat) => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <input
+                    value={manualNote}
+                    onChange={(e) => setManualNote(e.target.value)}
+                    placeholder="Note (optional)"
+                    className="w-full rounded-lg px-3 py-2 text-sm mb-2"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                  <button
+                    onClick={submitManualForm}
+                    className="w-full rounded-lg py-2 text-sm"
+                    style={{ background: COLORS.fresh, color: "#fff", fontWeight: 500 }}
+                  >
+                    Add item
+                  </button>
+                </div>
+              )}
+
+              <div className="mt-6">
+                <input
+                  value={dietary}
+                  onChange={(e) => setDietary(e.target.value)}
+                  placeholder="Dietary notes (optional) — e.g. vegetarian, no nuts"
+                  className="w-full rounded-lg px-3 py-2 text-sm mb-2"
+                  style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}
+                />
+                <button
+                  onClick={planWeek}
+                  disabled={inventory.length === 0 || planning}
+                  className="w-full rounded-lg py-2.5 text-sm flex items-center justify-center gap-2"
+                  style={{ background: inventory.length === 0 ? COLORS.border : COLORS.fresh, color: "#fff", fontWeight: 500 }}
+                >
+                  {planning ? <Loader2 size={15} className="animate-spin" /> : <Calendar size={15} />}
+                  {planning ? "Planning your week..." : "Plan my week"}
+                </button>
+                {planError && <div style={{ color: COLORS.urgent, fontSize: 12, marginTop: 6 }}>{planError}</div>}
+              </div>
+            </div>
+
+            <div>
+              {loadingInventory && (
+                <div className="flex items-center justify-center gap-2 py-6" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
+                  <Loader2 size={14} className="animate-spin" /> Loading your pantry...
+                </div>
+              )}
+
+              {!loadingInventory && inventory.length === 0 && !scanning && (
+                <div className="text-center py-6" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
+                  Nothing scanned yet. Take a photo, or add an item below.
+                </div>
+              )}
+
+              <div className="lg:grid lg:grid-cols-2 lg:gap-x-6">
+                {Object.entries(grouped).map(([cat, items]) => (
+                  <div key={cat} className="mb-4">
+                    <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: COLORS.inkSoft, marginBottom: 6 }}>
+                      {cat}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {items.map((item) => {
+                        const tier = expiryTier(item.expiresInDays);
+                        const tierBg = tier === "urgent" ? COLORS.urgentBg : tier === "soon" ? COLORS.soonBg : tier === "fresh" ? COLORS.freshBg : COLORS.surface;
+                        const tierColor = tier === "urgent" ? COLORS.urgent : tier === "soon" ? COLORS.soon : tier === "fresh" ? COLORS.fresh : COLORS.inkSoft;
+                        return (
+                          <div
+                            key={item.id}
+                            className="relative flex items-center gap-1.5 pl-2 pr-1.5 py-1.5 rounded-lg"
+                            style={{ background: tierBg, border: item.confidence === "low" ? `1px dashed ${tierColor}` : `0.5px solid ${COLORS.border}` }}
+                            title={item.note || (item.confidence === "low" ? "Not certain — tap to confirm" : "")}
+                          >
+                            <span style={{ width: 6, height: 6, borderRadius: 999, background: CATEGORY_DOTS[cat] || CATEGORY_DOTS.other, flexShrink: 0 }} />
+                            <input
+                              value={item.name}
+                              onChange={(e) => updateItemLocal(item.id, { name: e.target.value })}
+                              onBlur={(e) => commitItem(item.id, { name: e.target.value })}
+                              style={{ background: "transparent", fontSize: 13, fontWeight: 500, color: COLORS.ink, width: Math.max(item.name.length, 4) + "ch" }}
+                            />
+                            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: tierColor }}>
+                              {item.quantityAmount != null ? `${item.quantityAmount} ${item.quantityUnit || ""}`.trim() : "—"}
+                            </span>
+                            {item.confidence === "low" && <AlertTriangle size={11} color={tierColor} />}
+                            <button onClick={() => removeItem(item.id)} aria-label={`Remove ${item.name}`} style={{ color: COLORS.inkSoft }}>
+                              <X size={12} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         )}
 
         {tab === "week" && (
           <div>
-            {weekPlan.length === 0 ? (
+            <div className="flex gap-1 mb-4 p-1 rounded-lg inline-flex" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+              {[
+                { key: "auto", label: "Auto plan" },
+                { key: "browse", label: "Browse recipes" },
+              ].map((v) => (
+                <button
+                  key={v.key}
+                  onClick={() => setWeekView(v.key)}
+                  className="px-4 py-1.5 rounded-md text-sm"
+                  style={{
+                    background: weekView === v.key ? COLORS.fresh : "transparent",
+                    color: weekView === v.key ? "#fff" : COLORS.inkSoft,
+                    fontWeight: 500,
+                  }}
+                >
+                  {v.label}
+                </button>
+              ))}
+            </div>
+
+            {weekView === "auto" && (weekPlan.length === 0 ? (
               <div className="text-center py-10" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
                 No plan yet. Head to Pantry and tap "Plan my week."
               </div>
             ) : (
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 lg:grid lg:grid-cols-2 lg:gap-3">
                 {weekPlan.map((day) => (
                   <div key={day.day} className="rounded-xl p-3" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
                     <div
@@ -749,6 +1256,216 @@ export default function App() {
                   </div>
                 ))}
               </div>
+            ))}
+
+            {weekView === "browse" && (
+              <div>
+                {recipesError && (
+                  <div className="rounded-lg p-3 mb-4 text-sm" style={{ background: COLORS.urgentBg, color: COLORS.urgent }}>
+                    {recipesError}
+                  </div>
+                )}
+
+                <div className="flex gap-2 mb-4">
+                  <input
+                    value={recipeSearch}
+                    onChange={(e) => setRecipeSearch(e.target.value)}
+                    placeholder="Search recipes or ingredients — e.g. chicken, vegetarian"
+                    className="flex-1 rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                  <button
+                    onClick={openNewRecipe}
+                    className="rounded-lg px-3 flex items-center gap-1 text-sm"
+                    style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}`, color: COLORS.fresh, fontWeight: 500 }}
+                  >
+                    <Plus size={14} /> New
+                  </button>
+                </div>
+
+                {selectedRecipeIds.size > 0 && (
+                  <div className="rounded-lg p-3 mb-4" style={{ background: COLORS.freshBg }}>
+                    <div className="flex items-center justify-between mb-2">
+                      <span style={{ fontSize: 13, color: COLORS.fresh, fontWeight: 500 }}>
+                        {selectedRecipeIds.size} recipe{selectedRecipeIds.size !== 1 ? "s" : ""} selected for this week
+                      </span>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => { setSelectedRecipeIds(new Set()); setGroceryListGenerated(false); }}
+                          style={{ fontSize: 12, color: COLORS.inkSoft }}
+                        >
+                          Clear
+                        </button>
+                        <button
+                          onClick={() => setGroceryListGenerated(true)}
+                          className="rounded-lg px-3 py-1 text-sm"
+                          style={{ background: COLORS.fresh, color: "#fff", fontWeight: 500 }}
+                        >
+                          Generate groceries list
+                        </button>
+                      </div>
+                    </div>
+
+                    {groceryListGenerated && (
+                      <div className="mt-2 pt-2" style={{ borderTop: `0.5px solid ${COLORS.fresh}` }}>
+                        {groceryResults.length === 0 ? (
+                          <div style={{ fontSize: 12, color: COLORS.inkSoft }}>Selected recipes have no ingredients listed.</div>
+                        ) : (
+                          groceryResults.map((r) => (
+                            <div key={r.name + r.unit} className="mb-2">
+                              <div className="flex justify-between" style={{ fontSize: 12 }}>
+                                <span style={{ textTransform: "capitalize" }}>{r.name}</span>
+                                <span style={{ color: COLORS.inkSoft, fontFamily: "'IBM Plex Mono', monospace" }}>
+                                  {r.availableBase.toFixed(0)} / {r.neededBase.toFixed(0)} {r.unit}
+                                </span>
+                              </div>
+                              <div className="w-full rounded-full overflow-hidden" style={{ height: 6, background: "#fff" }}>
+                                <div
+                                  style={{
+                                    width: `${r.percent}%`,
+                                    height: "100%",
+                                    background: r.percent >= 100 ? COLORS.fresh : r.percent > 0 ? COLORS.soon : COLORS.urgent,
+                                  }}
+                                />
+                              </div>
+                              {r.missingBase > 0 && (
+                                <div style={{ fontSize: 11, color: COLORS.urgent, marginTop: 2 }}>
+                                  Buy {r.missingBase.toFixed(0)} {r.unit} more
+                                </div>
+                              )}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {editingRecipeId && (
+                  <div className="rounded-xl p-3 mb-4 lg:max-w-lg" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>
+                      {editingRecipeId === "new" ? "New recipe" : "Edit recipe"}
+                    </div>
+                    <input
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                      placeholder="Recipe name *"
+                      className="w-full rounded-lg px-3 py-2 text-sm mb-2"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    />
+                    <input
+                      value={editTags}
+                      onChange={(e) => setEditTags(e.target.value)}
+                      placeholder="Tags, comma separated — e.g. vegetarian, vegan"
+                      className="w-full rounded-lg px-3 py-2 text-sm mb-2"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    />
+                    <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Ingredients</div>
+                    {editIngredients.map((ing) => (
+                      <div key={ing.id} className="flex gap-2 mb-2">
+                        <input
+                          value={ing.name}
+                          onChange={(e) => updateEditIngredient(ing.id, { name: e.target.value })}
+                          placeholder="Ingredient"
+                          className="flex-1 rounded-lg px-2 py-1.5 text-sm"
+                          style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                        />
+                        <input
+                          value={ing.amount}
+                          onChange={(e) => updateEditIngredient(ing.id, { amount: e.target.value })}
+                          type="number"
+                          step="any"
+                          placeholder="Amt"
+                          className="w-16 rounded-lg px-2 py-1.5 text-sm"
+                          style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                        />
+                        <select
+                          value={ing.unit}
+                          onChange={(e) => updateEditIngredient(ing.id, { unit: e.target.value })}
+                          className="rounded-lg px-1 py-1.5 text-sm"
+                          style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                        >
+                          <option value="pcs">pcs</option>
+                          <option value="g">g</option>
+                          <option value="kg">kg</option>
+                          <option value="ml">ml</option>
+                          <option value="l">l</option>
+                        </select>
+                        <button onClick={() => removeEditIngredient(ing.id)} style={{ color: COLORS.inkSoft }}>
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
+                    <button onClick={addEditIngredient} className="text-sm mb-3" style={{ color: COLORS.fresh, fontWeight: 500 }}>
+                      + Add ingredient
+                    </button>
+                    <textarea
+                      value={editInstructions}
+                      onChange={(e) => setEditInstructions(e.target.value)}
+                      placeholder="Instructions"
+                      rows={3}
+                      className="w-full rounded-lg px-3 py-2 text-sm mb-3"
+                      style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={closeEditRecipe}
+                        className="flex-1 rounded-lg py-2 text-sm"
+                        style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}`, color: COLORS.inkSoft }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={saveRecipe}
+                        className="flex-1 rounded-lg py-2 text-sm"
+                        style={{ background: COLORS.fresh, color: "#fff", fontWeight: 500 }}
+                      >
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="lg:grid lg:grid-cols-2 lg:gap-3">
+                  {filteredRecipes.map((recipe) => (
+                    <div
+                      key={recipe.id}
+                      className="rounded-xl p-3 mb-3"
+                      style={{ background: COLORS.surface, border: `0.5px solid ${selectedRecipeIds.has(recipe.id) ? COLORS.fresh : COLORS.border}` }}
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex items-start gap-2">
+                          <input
+                            type="checkbox"
+                            checked={selectedRecipeIds.has(recipe.id)}
+                            onChange={() => toggleRecipeSelected(recipe.id)}
+                            style={{ marginTop: 4 }}
+                          />
+                          <div>
+                            <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>{recipe.name}</div>
+                            {recipe.tags?.length > 0 && (
+                              <div style={{ fontSize: 11, color: COLORS.inkSoft }}>{recipe.tags.join(", ")}</div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex gap-2">
+                          <button onClick={() => openEditRecipe(recipe)} style={{ fontSize: 11, color: COLORS.fresh, fontWeight: 500 }}>
+                            {recipe.household_id === null ? "Edit (fork)" : "Edit"}
+                          </button>
+                          {recipe.household_id !== null && (
+                            <button onClick={() => removeRecipe(recipe)} style={{ color: COLORS.inkSoft }}>
+                              <X size={14} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 12, color: COLORS.inkSoft, marginTop: 6 }}>
+                        {(recipe.ingredients || []).map((ing) => `${ing.amount} ${ing.unit} ${ing.name}`).join(" · ")}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
         )}
@@ -761,7 +1478,7 @@ export default function App() {
               </div>
             ) : (
               <div
-                className="rounded-lg p-4"
+                className="rounded-lg p-4 lg:max-w-lg"
                 style={{
                   background: COLORS.surface,
                   fontFamily: "'IBM Plex Mono', monospace",
@@ -807,7 +1524,7 @@ export default function App() {
               </div>
             )}
 
-            <div className="rounded-xl p-3 mb-4" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+            <div className="rounded-xl p-3 mb-4 lg:max-w-lg" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
               <input
                 value={choreTitle}
                 onChange={(e) => setChoreTitle(e.target.value)}
@@ -847,6 +1564,13 @@ export default function App() {
                   className="flex-1 rounded-lg px-3 py-2 text-sm"
                   style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
                 />
+                <input
+                  type="time"
+                  value={choreDueTime}
+                  onChange={(e) => setChoreDueTime(e.target.value)}
+                  className="rounded-lg px-3 py-2 text-sm"
+                  style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                />
                 <button
                   onClick={addChore}
                   className="rounded-lg px-4 text-sm"
@@ -857,12 +1581,97 @@ export default function App() {
               </div>
             </div>
 
-            {chores.length === 0 ? (
+            <div className="flex gap-1 mb-4 p-1 rounded-lg inline-flex" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+              {["list", "calendar"].map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setChoresView(v)}
+                  className="px-4 py-1.5 rounded-md text-sm capitalize"
+                  style={{
+                    background: choresView === v ? COLORS.fresh : "transparent",
+                    color: choresView === v ? "#fff" : COLORS.inkSoft,
+                    fontWeight: 500,
+                  }}
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+
+            {choresView === "calendar" && (
+              <div className="rounded-xl p-3 mb-4 lg:max-w-2xl" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+                <div className="flex items-center justify-between mb-3">
+                  <button
+                    onClick={() => setCalendarMonth((m) => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+                    style={{ color: COLORS.inkSoft }}
+                  >
+                    <ChevronDown size={16} style={{ transform: "rotate(90deg)" }} />
+                  </button>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>
+                    {calendarMonth.toLocaleDateString(undefined, { month: "long", year: "numeric" })}
+                  </div>
+                  <button
+                    onClick={() => setCalendarMonth((m) => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+                    style={{ color: COLORS.inkSoft }}
+                  >
+                    <ChevronDown size={16} style={{ transform: "rotate(-90deg)" }} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-7 gap-1 mb-1">
+                  {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => (
+                    <div key={i} style={{ fontSize: 10, textAlign: "center", color: COLORS.inkSoft }}>{d}</div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-7 gap-1">
+                  {buildCalendarGrid(calendarMonth).map((date, i) => {
+                    if (!date) return <div key={i} />;
+                    const key = toDateKey(date);
+                    const dayChores = chores.filter((c) => c.due_date === key);
+                    const isToday = key === toDateKey(new Date());
+                    return (
+                      <div
+                        key={i}
+                        className="rounded-md p-1"
+                        style={{
+                          minHeight: 56,
+                          background: isToday ? COLORS.freshBg : COLORS.bg,
+                          border: isToday ? `1px solid ${COLORS.fresh}` : `0.5px solid ${COLORS.border}`,
+                        }}
+                      >
+                        <div style={{ fontSize: 10, color: COLORS.inkSoft, marginBottom: 2 }}>{date.getDate()}</div>
+                        {dayChores.slice(0, 3).map((c) => (
+                          <div
+                            key={c.id}
+                            onClick={() => toggleChore(c.id, c.done)}
+                            className="cursor-pointer"
+                            style={{
+                              fontSize: 9,
+                              lineHeight: 1.3,
+                              marginBottom: 1,
+                              color: c.done ? COLORS.inkSoft : COLORS.ink,
+                              textDecoration: c.done ? "line-through" : "none",
+                            }}
+                            title={c.due_time ? `${c.title} at ${c.due_time}` : c.title}
+                          >
+                            {c.due_time ? c.due_time.slice(0, 5) + " " : ""}{c.title}
+                          </div>
+                        ))}
+                        {dayChores.length > 3 && (
+                          <div style={{ fontSize: 9, color: COLORS.inkSoft }}>+{dayChores.length - 3} more</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {choresView === "list" && (chores.length === 0 ? (
               <div className="text-center py-6" style={{ color: COLORS.inkSoft, fontSize: 13 }}>
                 No chores yet. Add one above.
               </div>
             ) : (
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 lg:grid lg:grid-cols-2 lg:gap-3">
                 {chores.map((chore) => {
                   const overdue = !chore.done && chore.due_date && new Date(chore.due_date) < new Date(new Date().toDateString());
                   return (
@@ -885,7 +1694,7 @@ export default function App() {
                         </div>
                         <div style={{ fontSize: 11, color: overdue ? COLORS.urgent : COLORS.inkSoft }}>
                           {memberLabel(chore.assigned_to)}
-                          {chore.due_date ? ` · due ${chore.due_date}${overdue ? " (overdue)" : ""}` : ""}
+                          {chore.due_date ? ` · due ${chore.due_date}${chore.due_time ? ` ${chore.due_time.slice(0, 5)}` : ""}${overdue ? " (overdue)" : ""}` : ""}
                           {chore.recurrence !== "none" ? ` · ${chore.recurrence}` : ""}
                         </div>
                       </div>
@@ -896,7 +1705,7 @@ export default function App() {
                   );
                 })}
               </div>
-            )}
+            ))}
           </div>
         )}
 
@@ -908,9 +1717,143 @@ export default function App() {
               </div>
             )}
 
+            <div className="rounded-xl p-4 mb-4 lg:max-w-2xl" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+              <div className="flex items-center justify-between mb-3">
+                <div style={{ fontSize: 13, fontWeight: 500 }}>Household finances</div>
+                {budgetHealth.status !== "unset" && (
+                  <span
+                    className="px-2 py-0.5 rounded-full text-xs"
+                    style={{
+                      background: budgetHealth.status === "healthy" ? COLORS.freshBg : budgetHealth.status === "caution" ? COLORS.soonBg : COLORS.urgentBg,
+                      color: budgetHealth.status === "healthy" ? COLORS.fresh : budgetHealth.status === "caution" ? COLORS.soon : COLORS.urgent,
+                      fontWeight: 500,
+                    }}
+                  >
+                    {budgetHealth.status === "healthy" ? "Healthy" : budgetHealth.status === "caution" ? "Caution" : "Needs attention"}
+                  </span>
+                )}
+              </div>
+
+              {budgetHealth.status === "unset" ? (
+                <div style={{ fontSize: 12, color: COLORS.inkSoft, marginBottom: 10 }}>
+                  Set a monthly income below to see a financial health check.
+                </div>
+              ) : (
+                <div className="mb-3 flex flex-col gap-2">
+                  {budgetHealth.checks.map((c) => (
+                    <div key={c.key} className="flex items-start gap-2">
+                      {c.pass ? <CheckSquare size={14} color={COLORS.fresh} style={{ marginTop: 1 }} /> : <AlertTriangle size={14} color={COLORS.urgent} style={{ marginTop: 1 }} />}
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 500, color: c.pass ? COLORS.ink : COLORS.urgent }}>{c.label}</div>
+                        <div style={{ fontSize: 11, color: COLORS.inkSoft }}>{c.detail}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-2 mb-2">
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Monthly income</div>
+                  <input
+                    value={incomeInput}
+                    onChange={(e) => setIncomeInput(e.target.value)}
+                    type="number"
+                    step="0.01"
+                    placeholder="e.g. 5000"
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Savings goal %</div>
+                  <input
+                    value={savingsGoalInput}
+                    onChange={(e) => setSavingsGoalInput(e.target.value)}
+                    type="number"
+                    step="1"
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Monthly debt payments</div>
+                  <input
+                    value={debtInput}
+                    onChange={(e) => setDebtInput(e.target.value)}
+                    type="number"
+                    step="0.01"
+                    placeholder="e.g. 500"
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Emergency fund balance</div>
+                  <input
+                    value={emergencyFundInput}
+                    onChange={(e) => setEmergencyFundInput(e.target.value)}
+                    type="number"
+                    step="0.01"
+                    placeholder="e.g. 3000"
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 4 }}>Emergency fund target (months)</div>
+                  <input
+                    value={emergencyMonthsInput}
+                    onChange={(e) => setEmergencyMonthsInput(e.target.value)}
+                    type="number"
+                    step="1"
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: COLORS.bg, border: `0.5px solid ${COLORS.border}` }}
+                  />
+                </div>
+                <div className="flex items-end">
+                  <button
+                    onClick={saveBudgetSettings}
+                    disabled={savingBudget}
+                    className="w-full rounded-lg px-4 py-2 text-sm"
+                    style={{ background: COLORS.fresh, color: "#fff", fontWeight: 500 }}
+                  >
+                    {savingBudget ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </div>
+
+              {monthlyTotals.length > 1 && (
+                <div className="mt-4 pt-4" style={{ borderTop: `0.5px solid ${COLORS.border}` }}>
+                  <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: COLORS.inkSoft, marginBottom: 8 }}>
+                    Spend trend
+                  </div>
+                  <div className="flex items-end gap-2" style={{ height: 60 }}>
+                    {[...monthlyTotals].reverse().slice(-6).map(([month, total]) => {
+                      const max = Math.max(...monthlyTotals.map(([, t]) => t), 1);
+                      return (
+                        <div key={month} className="flex-1 flex flex-col items-center justify-end h-full">
+                          <div
+                            style={{
+                              width: "100%",
+                              height: `${Math.max((total / max) * 100, 4)}%`,
+                              background: COLORS.fresh,
+                              borderRadius: 3,
+                            }}
+                            title={`${month}: $${total.toFixed(2)}`}
+                          />
+                          <div style={{ fontSize: 9, color: COLORS.inkSoft, marginTop: 3 }}>{month.slice(5)}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
             {!reviewItems && (
               <div
-                className="rounded-xl p-5 mb-4 flex flex-col items-center text-center cursor-pointer"
+                className="rounded-xl p-5 mb-4 flex flex-col items-center text-center cursor-pointer lg:max-w-lg"
                 style={{ background: COLORS.surface, border: `1px dashed ${COLORS.border}` }}
                 onClick={() => receiptInputRef.current?.click()}
               >
@@ -927,7 +1870,7 @@ export default function App() {
             )}
 
             {reviewItems && (
-              <div className="rounded-xl p-3 mb-4" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
+              <div className="rounded-xl p-3 mb-4 lg:max-w-lg" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
                 <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>
                   Review before saving {reviewItems.length === 0 && "— nothing detected automatically, add lines by hand"}
                 </div>
@@ -1006,7 +1949,7 @@ export default function App() {
                 No receipts yet. Scan one above.
               </div>
             ) : (
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 lg:grid lg:grid-cols-2 lg:gap-3">
                 {receipts.map((r) => (
                   <div key={r.id} className="rounded-lg p-3" style={{ background: COLORS.surface, border: `0.5px solid ${COLORS.border}` }}>
                     <div className="flex items-center justify-between">
@@ -1024,6 +1967,8 @@ export default function App() {
             )}
           </div>
         )}
+          </div>
+        </div>
       </div>
     </div>
   );

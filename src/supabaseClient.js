@@ -86,6 +86,33 @@ export async function getOrCreateDefaultHousehold() {
   return createHousehold("My Household");
 }
 
+export async function getHousehold(householdId) {
+  const { data, error } = await supabase
+    .from("households")
+    .select("id, name, monthly_income, savings_goal_percent, monthly_debt_payments, emergency_fund_balance, emergency_fund_target_months")
+    .eq("id", householdId)
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function updateHouseholdBudget(householdId, { monthlyIncome, savingsGoalPercent, monthlyDebtPayments, emergencyFundBalance, emergencyFundTargetMonths }) {
+  const { data, error } = await supabase
+    .from("households")
+    .update({
+      monthly_income: monthlyIncome,
+      savings_goal_percent: savingsGoalPercent,
+      monthly_debt_payments: monthlyDebtPayments,
+      emergency_fund_balance: emergencyFundBalance,
+      emergency_fund_target_months: emergencyFundTargetMonths,
+    })
+    .eq("id", householdId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 // ── Inventory ────────────────────────────────────────────────
 
 export async function getInventory(householdId) {
@@ -98,20 +125,33 @@ export async function getInventory(householdId) {
   return data;
 }
 
-// Upserts a batch of scanned/manual items. Matches existing rows by
+// Upserts a batch of scanned items. Matches existing rows by
 // (household_id, name) case-insensitively via the name_normalized column,
 // so re-scanning "Banana" updates the existing row instead of duplicating it.
+// Scanned items don't carry a real quantity/unit from YOLO (just a box
+// count), so they default to a plain count in "pcs" — the user can correct
+// this via "Fill manually" if it's wrong.
 export async function upsertInventoryItems(householdId, items) {
-  const rows = items.map((item) => ({
-    household_id: householdId,
-    name: item.name,
-    quantity: item.quantity ?? item.quantity_estimate ?? null,
-    category: item.category || "other",
-    confidence: item.confidence || "medium",
-    expires_in_days: item.expiresInDays ?? item.expires_in_days ?? null,
-    note: item.note || null,
-    source: item.source || "scan",
-  }));
+  const today = new Date();
+  const rows = items.map((item) => {
+    const rawExpiresInDays = item.expiresInDays ?? item.expires_in_days ?? null;
+    const expiryDate = rawExpiresInDays != null
+      ? new Date(today.getTime() + rawExpiresInDays * 86400000).toISOString().slice(0, 10)
+      : null;
+    const count = parseInt(item.quantity_estimate ?? item.quantity, 10);
+
+    return {
+      household_id: householdId,
+      name: item.name,
+      category: item.category || "other",
+      confidence: item.confidence || "medium",
+      note: item.note || null,
+      source: item.source || "scan",
+      quantity_amount: isNaN(count) ? 1 : count,
+      quantity_unit: "pcs",
+      expiry_date: expiryDate,
+    };
+  });
 
   const { data, error } = await supabase
     .from("inventory_items")
@@ -121,11 +161,36 @@ export async function upsertInventoryItems(householdId, items) {
   return data;
 }
 
-export async function addManualInventoryItem(householdId, name) {
+// Fast one-line add — defaults to "1 pcs", no expiry. Matches the old quick
+// add-by-hand flow. Use addManualInventoryItem for the full form.
+export async function quickAddInventoryItem(householdId, name) {
   const { data, error } = await supabase
     .from("inventory_items")
     .upsert(
-      [{ household_id: householdId, name, source: "manual" }],
+      [{ household_id: householdId, name, source: "manual", quantity_amount: 1, quantity_unit: "pcs" }],
+      { onConflict: "household_id,name_normalized" }
+    )
+    .select();
+  if (error) throw error;
+  return data[0];
+}
+
+// Full manual entry — name, quantityAmount, quantityUnit are required by the
+// UI form; category, expiryDate, note are optional.
+export async function addManualInventoryItem(householdId, { name, quantityAmount, quantityUnit, expiryDate, category, note }) {
+  const { data, error } = await supabase
+    .from("inventory_items")
+    .upsert(
+      [{
+        household_id: householdId,
+        name,
+        quantity_amount: quantityAmount,
+        quantity_unit: quantityUnit,
+        expiry_date: expiryDate || null,
+        category: category || "other",
+        note: note || null,
+        source: "manual",
+      }],
       { onConflict: "household_id,name_normalized" }
     )
     .select();
@@ -168,7 +233,7 @@ export async function getChores(householdId) {
   return data;
 }
 
-export async function createChore(householdId, { title, assignedTo, dueDate, recurrence }) {
+export async function createChore(householdId, { title, assignedTo, dueDate, dueTime, recurrence }) {
   const { data: userData } = await supabase.auth.getUser();
   const { data, error } = await supabase
     .from("chores")
@@ -177,6 +242,7 @@ export async function createChore(householdId, { title, assignedTo, dueDate, rec
       title,
       assigned_to: assignedTo || null,
       due_date: dueDate || null,
+      due_time: dueTime || null,
       recurrence: recurrence || "none",
       created_by: userData.user.id,
     }])
@@ -197,6 +263,72 @@ export async function toggleChoreDone(id, done) {
 
 export async function deleteChore(id) {
   const { error } = await supabase.from("chores").delete().eq("id", id);
+  if (error) throw error;
+}
+
+// ── Recipe library ───────────────────────────────────────────
+
+export async function getRecipes(householdId) {
+  // RLS already scopes this to global (household_id null) + your own
+  // household's recipes — no need to filter client-side.
+  const { data, error } = await supabase
+    .from("recipes")
+    .select("*")
+    .order("name", { ascending: true });
+  if (error) throw error;
+  return data;
+}
+
+// Editing a global recipe (household_id null) creates a new household-owned
+// copy instead of mutating the shared original — RLS wouldn't allow mutating
+// it anyway (update policy requires household_id is not null), but forking
+// explicitly here gives a clear, intentional "make this yours" action rather
+// than a confusing permission error.
+export async function forkOrUpdateRecipe(householdId, recipe, patch) {
+  const { data: userData } = await supabase.auth.getUser();
+  if (recipe.household_id === null) {
+    const { data, error } = await supabase
+      .from("recipes")
+      .insert([{
+        household_id: householdId,
+        name: patch.name ?? recipe.name,
+        ingredients: patch.ingredients ?? recipe.ingredients,
+        tags: patch.tags ?? recipe.tags,
+        instructions: patch.instructions ?? recipe.instructions,
+        created_by: userData.user.id,
+      }])
+      .select();
+    if (error) throw error;
+    return data[0];
+  }
+  const { data, error } = await supabase
+    .from("recipes")
+    .update(patch)
+    .eq("id", recipe.id)
+    .select();
+  if (error) throw error;
+  return data[0];
+}
+
+export async function createRecipe(householdId, { name, ingredients, tags, instructions }) {
+  const { data: userData } = await supabase.auth.getUser();
+  const { data, error } = await supabase
+    .from("recipes")
+    .insert([{
+      household_id: householdId,
+      name,
+      ingredients: ingredients || [],
+      tags: tags || [],
+      instructions: instructions || "",
+      created_by: userData.user.id,
+    }])
+    .select();
+  if (error) throw error;
+  return data[0];
+}
+
+export async function deleteRecipe(id) {
+  const { error } = await supabase.from("recipes").delete().eq("id", id);
   if (error) throw error;
 }
 
